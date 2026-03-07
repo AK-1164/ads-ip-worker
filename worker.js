@@ -191,15 +191,10 @@ async function countIpBlocks(env, accessToken) {
 }
 
 function googleHeaders(env, accessToken) {
-  const headers = {
+  return {
     "Content-Type": "application/json",
     "Authorization": `Bearer ${accessToken}`,
     "developer-token": env.GOOGLE_DEVELOPER_TOKEN,
+    "login-customer-id": "1486808188"
   };
-
-  if (env.GOOGLE_LOGIN_CUSTOMER_ID) {
-    headers["login-customer-id"] = env.GOOGLE_LOGIN_CUSTOMER_ID;
-  }
-
-  return headers;
 }
