@@ -6,59 +6,25 @@ export default {
 };
 
 async function run(env) {
-  const kv = env.VISITS;
-
-  const batch = await kv.list({ prefix: "push:", limit: 50 });
-  if (!batch.keys || batch.keys.length === 0) return;
-
   const accessToken = await getAccessToken(env);
 
-  let order = [];
-  const orderRaw = await kv.get("ads:order");
-  if (orderRaw) {
-    try {
-      order = JSON.parse(orderRaw);
-    } catch {}
-  }
-  if (!Array.isArray(order)) order = [];
+  const query = `
+    SELECT customer.id, customer.descriptive_name
+    FROM customer
+    LIMIT 1
+  `;
 
-  for (const k of batch.keys) {
-    const keyName = k.name;
+  const url = `https://googleads.googleapis.com/v22/customers/${env.GOOGLE_ADS_CUSTOMER_ID}/googleAds:search`;
 
-    // push:<now>:<country>:<ip>
-    const parts = keyName.split(":");
-    const ip = parts.slice(3).join(":"); // يدعم IPv6
-    if (!ip) {
-      await kv.delete(keyName);
-      continue;
-    }
+  const r = await fetch(url, {
+    method: "POST",
+    headers: googleHeaders(env, accessToken),
+    body: JSON.stringify({ query }),
+  });
 
-    const doneKey = `ads:done:${ip}`;
-    const alreadyDone = await kv.get(doneKey);
-    if (alreadyDone) {
-      await kv.delete(keyName);
-      continue;
-    }
-
-    const count = await countIpBlocks(env, accessToken);
-    if (count >= 500) {
-      await removeOldest(env, accessToken, kv, order);
-    }
-
-    const resourceName = await addIpBlock(env, accessToken, ip);
-
-    if (resourceName) {
-      order.push(ip);
-      await kv.put("ads:order", JSON.stringify(order));
-      await kv.put(`ads:ip:${ip}`, resourceName);
-      await kv.put(doneKey, "1", { expirationTtl: 7 * 24 * 3600 });
-
-      // احذف push فقط إذا نجحت الإضافة
-      await kv.delete(keyName);
-    } else {
-      console.log("Google Ads addIpBlock failed for IP:", ip);
-    }
-  }
+  const txt = await r.text();
+  console.log("TEST STATUS:", r.status);
+  console.log("TEST BODY:", txt);
 }
 
 async function getAccessToken(env) {
@@ -191,10 +157,15 @@ async function countIpBlocks(env, accessToken) {
 }
 
 function googleHeaders(env, accessToken) {
-  return {
+  const headers = {
     "Content-Type": "application/json",
     "Authorization": `Bearer ${accessToken}`,
     "developer-token": env.GOOGLE_DEVELOPER_TOKEN,
-    "login-customer-id": "1486808188"
   };
+
+  if (env.GOOGLE_LOGIN_CUSTOMER_ID) {
+    headers["login-customer-id"] = env.GOOGLE_LOGIN_CUSTOMER_ID;
+  }
+
+  return headers;
 }
