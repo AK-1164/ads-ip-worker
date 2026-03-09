@@ -1,11 +1,64 @@
-
 export default {
+  async fetch(request, env, ctx) {
+    return handleFetch(request, env, ctx);
+  },
+
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(run(env));
+    ctx.waitUntil(runRetryQueue(env));
   },
 };
 
-async function run(env) {
+async function handleFetch(request, env, ctx) {
+  if (request.method !== "POST") {
+    return new Response("Method Not Allowed", { status: 405 });
+  }
+
+  const secret = request.headers.get("x-worker-secret");
+  if (!secret || secret !== env.WORKER_SHARED_SECRET) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response("Invalid JSON", { status: 400 });
+  }
+
+  const ip = body?.ip;
+  const country = body?.country || "XX";
+  const ts = body?.ts || Math.floor(Date.now() / 1000);
+
+  if (!ip) {
+    return new Response("Missing IP", { status: 400 });
+  }
+
+  try {
+    const accessToken = await getAccessToken(env);
+    const ok = await processSingleIp(env, accessToken, ip);
+
+    if (ok) {
+      console.log("Direct add success:", ip);
+      return new Response("OK", { status: 200 });
+    }
+
+    // فشل الإضافة → خزّن push احتياطيًا
+    const key = `push:${ts}:${country}:${ip}`;
+    await env.VISITS.put(key, "1", { expirationTtl: 7 * 24 * 3600 });
+
+    console.log("Direct add failed, saved to retry queue:", ip);
+    return new Response("Queued", { status: 202 });
+  } catch (err) {
+    // أي خطأ عام → خزّن push احتياطيًا
+    const key = `push:${ts}:${country}:${ip}`;
+    await env.VISITS.put(key, "1", { expirationTtl: 7 * 24 * 3600 });
+
+    console.log("Direct worker exception, saved to retry queue:", ip, String(err));
+    return new Response("Queued", { status: 202 });
+  }
+}
+
+async function runRetryQueue(env) {
   const kv = env.VISITS;
 
   const batch = await kv.list({ prefix: "push:", limit: 50 });
@@ -26,7 +79,7 @@ async function run(env) {
     const keyName = k.name;
 
     const parts = keyName.split(":");
-    const ip = parts.slice(3).join(":");
+    const ip = parts.slice(3).join(":"); // يدعم IPv6
     if (!ip) {
       await kv.delete(keyName);
       continue;
@@ -52,11 +105,46 @@ async function run(env) {
       await kv.put(`ads:ip:${ip}`, resourceName);
       await kv.put(doneKey, "1", { expirationTtl: 7 * 24 * 3600 });
       await kv.delete(keyName);
-      console.log("IP added successfully:", ip);
+      console.log("Retry add success:", ip);
     } else {
-      console.log("Google Ads addIpBlock failed for IP:", ip);
+      console.log("Retry add failed:", ip);
     }
   }
+}
+
+async function processSingleIp(env, accessToken, ip) {
+  const kv = env.VISITS;
+
+  const doneKey = `ads:done:${ip}`;
+  const alreadyDone = await kv.get(doneKey);
+  if (alreadyDone) {
+    console.log("Already done, skip:", ip);
+    return true;
+  }
+
+  let order = [];
+  const orderRaw = await kv.get("ads:order");
+  if (orderRaw) {
+    try {
+      order = JSON.parse(orderRaw);
+    } catch {}
+  }
+  if (!Array.isArray(order)) order = [];
+
+  const count = await countIpBlocks(env, accessToken);
+  if (count >= 500) {
+    await removeOldest(env, accessToken, kv, order);
+  }
+
+  const resourceName = await addIpBlock(env, accessToken, ip);
+  if (!resourceName) return false;
+
+  order.push(ip);
+  await kv.put("ads:order", JSON.stringify(order));
+  await kv.put(`ads:ip:${ip}`, resourceName);
+  await kv.put(doneKey, "1", { expirationTtl: 7 * 24 * 3600 });
+
+  return true;
 }
 
 async function getAccessToken(env) {
@@ -109,13 +197,7 @@ async function addIpBlock(env, accessToken, ip) {
   const j = await r.json();
 
   if (!r.ok) {
-    console.log(
-      "addIpBlock failed",
-      ip,
-      "status:",
-      r.status,
-      JSON.stringify(j)
-    );
+    console.log("addIpBlock failed", ip, "status:", r.status, JSON.stringify(j));
     return null;
   }
 
@@ -189,15 +271,10 @@ async function countIpBlocks(env, accessToken) {
 }
 
 function googleHeaders(env, accessToken) {
-  const headers = {
+  return {
     "Content-Type": "application/json",
     "Authorization": `Bearer ${accessToken}`,
     "developer-token": env.GOOGLE_DEVELOPER_TOKEN,
+    "login-customer-id": "1486808188"
   };
-
-  if (env.GOOGLE_LOGIN_CUSTOMER_ID) {
-    headers["login-customer-id"] = env.GOOGLE_LOGIN_CUSTOMER_ID;
-  }
-
-  return headers;
 }
