@@ -278,3 +278,115 @@ function googleHeaders(env, accessToken) {
     "login-customer-id": "1486808188"
   };
 }
+
+export class IpGuard {
+  constructor(ctx, env) {
+    this.ctx = ctx;
+    this.env = env;
+    this.storage = ctx.storage;
+  }
+
+  async fetch(request) {
+    if (request.method !== "POST") {
+      return new Response("Method Not Allowed", { status: 405 });
+    }
+
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return new Response("Invalid JSON", { status: 400 });
+    }
+
+    const ip = body?.ip || "unknown";
+    const country = body?.country || "XX";
+
+    const now = Math.floor(Date.now() / 1000);
+    const windowSeconds = 24 * 3600;
+    const banSeconds = 7 * 24 * 3600;
+
+    const state = (await this.storage.get("state")) || {
+      ip,
+      country,
+      count: 0,
+      firstSeen: now,
+      lastSeen: now,
+      bannedUntil: 0,
+      pushNeeded: false
+    };
+
+    state.lastSeen = now;
+    state.ip = ip;
+    state.country = country;
+
+    // اليمن: حظر مباشر
+    if (country === "YE") {
+      state.bannedUntil = now + banSeconds;
+      state.pushNeeded = true;
+
+      await this.storage.put("state", state);
+
+      return Response.json({
+        ok: true,
+        action: "ban",
+        reason: "YE",
+        pushNeeded: true
+      });
+    }
+
+    // غير السعودية: دخول عادي بدون عداد
+    if (country !== "SA") {
+      await this.storage.put("state", state);
+
+      return Response.json({
+        ok: true,
+        action: "allow",
+        pushNeeded: false
+      });
+    }
+
+    // إذا كان محظورًا مسبقًا
+    if (state.bannedUntil && state.bannedUntil > now) {
+      state.count += 1;
+      await this.storage.put("state", state);
+
+      return Response.json({
+        ok: true,
+        action: "ban",
+        reason: "already_banned",
+        pushNeeded: false
+      });
+    }
+
+    // إعادة ضبط العداد بعد 24 ساعة
+    if (!state.firstSeen || (now - state.firstSeen) > windowSeconds) {
+      state.count = 0;
+      state.firstSeen = now;
+    }
+
+    state.count += 1;
+
+    // بعد المرتين: حظر
+    if (state.count > 2) {
+      state.bannedUntil = now + banSeconds;
+      state.pushNeeded = true;
+
+      await this.storage.put("state", state);
+
+      return Response.json({
+        ok: true,
+        action: "ban",
+        reason: "too_many_clicks",
+        pushNeeded: true
+      });
+    }
+
+    await this.storage.put("state", state);
+
+    return Response.json({
+      ok: true,
+      action: "allow",
+      pushNeeded: false
+    });
+  }
+}
