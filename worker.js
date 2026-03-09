@@ -1,5 +1,11 @@
 export default {
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/do-check") {
+      return handleDoCheck(request, env);
+    }
+
     return handleFetch(request, env, ctx);
   },
 
@@ -145,6 +151,36 @@ async function processSingleIp(env, accessToken, ip) {
   await kv.put(doneKey, "1", { expirationTtl: 7 * 24 * 3600 });
 
   return true;
+}
+
+async function handleDoCheck(request, env) {
+  if (request.method !== "POST") {
+    return new Response("Method Not Allowed", { status: 405 });
+  }
+
+  const secret = request.headers.get("x-worker-secret");
+  if (!secret || secret !== env.WORKER_SHARED_SECRET) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response("Invalid JSON", { status: 400 });
+  }
+
+  const ip = body?.ip || "unknown";
+  const country = body?.country || "XX";
+
+  const id = env.IP_GUARD.idFromName(ip);
+  const stub = env.IP_GUARD.get(id);
+
+  return stub.fetch("https://dummy/do", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ip, country }),
+  });
 }
 
 async function getAccessToken(env) {
