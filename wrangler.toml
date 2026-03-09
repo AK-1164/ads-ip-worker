@@ -1,3 +1,12 @@
-name = "ads-ip-excluder"
+name = "ads-ip-worker"
 main = "worker.js"
 compatibility_date = "2024-05-01"
+
+[durable_objects]
+bindings = [
+  { name = "IP_GUARD", class_name = "IpGuard" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["IpGuard"]
