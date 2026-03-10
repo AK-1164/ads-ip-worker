@@ -1,3 +1,8 @@
-name = "ads-ip-worker"
+name = "ads-ip-pusher"
 main = "worker.js"
 compatibility_date = "2024-05-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ads-ip-db"
+database_id = "13523267498f4457bd99eb571791c35d"
