@@ -1,14 +1,14 @@
 export default {
   async fetch(request, env, ctx) {
-    return handleFetch(request, env);
+    return handleFetch(request, env, ctx);
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runRetryQueue(env));
+    ctx.waitUntil(runRetryQueue(env, 20));
   },
 };
 
-async function handleFetch(request, env) {
+async function handleFetch(request, env, ctx) {
   if (request.method !== "POST") {
     return new Response("Method Not Allowed", { status: 405 });
   }
@@ -25,16 +25,29 @@ async function handleFetch(request, env) {
     return new Response("Invalid JSON", { status: 400 });
   }
 
-  const ip = body?.ip;
-  const country = body?.country || "XX";
-  const ts = body?.ts || Math.floor(Date.now() / 1000);
+  const ip = String(body?.ip || "").trim();
+  const country = String(body?.country || "XX").trim();
+  const ts = Number(body?.ts || Math.floor(Date.now() / 1000));
 
   if (!ip) {
     return new Response("Missing IP", { status: 400 });
   }
 
+  if (!isValidIp(ip)) {
+    await queueFailure(env, ip, country, ts, "invalid ip format");
+    return new Response("Invalid IP", { status: 400 });
+  }
+
+  const result = await processCurrentIp(env, ip, country, ts);
+
+  // بعد معالجة الطلب الحالي مباشرة، افحص الفاشل في الخلفية
+  ctx.waitUntil(runRetryQueue(env, 10, ip));
+
+  return new Response(result.message, { status: result.status });
+}
+
+async function processCurrentIp(env, ip, country, ts) {
   try {
-    // إذا كان مستبعدًا مسبقًا في D1، لا نكرر الإضافة
     const existing = await env.DB
       .prepare("SELECT ip FROM ads_exclusions WHERE ip = ?")
       .bind(ip)
@@ -42,16 +55,12 @@ async function handleFetch(request, env) {
 
     if (existing) {
       await safeUpdateIpLog(env, ip, 1, "already_excluded");
-      return new Response("Already excluded", { status: 200 });
+      await env.DB.prepare("DELETE FROM exclusion_queue WHERE ip = ?").bind(ip).run();
+      return { status: 200, message: "Already excluded" };
     }
 
     const accessToken = await getAccessToken(env);
     const resourceName = await addIpBlock(env, accessToken, ip);
-
-    if (!resourceName) {
-      await queueFailure(env, ip, country, ts, "addIpBlock returned null");
-      return new Response("Queued", { status: 202 });
-    }
 
     await env.DB.prepare(`
       INSERT INTO ads_exclusions (ip, resource_name, created_at)
@@ -65,32 +74,34 @@ async function handleFetch(request, env) {
     await env.DB.prepare("DELETE FROM exclusion_queue WHERE ip = ?").bind(ip).run();
 
     console.log("Direct add success:", ip);
-    return new Response("OK", { status: 200 });
+    return { status: 200, message: "OK" };
   } catch (err) {
-    const msg = String(err?.message || err || "unknown error");
+    const msg = normalizeError(err);
     await queueFailure(env, ip, country, ts, msg);
     console.log("Direct worker exception, queued:", ip, msg);
-    return new Response("Queued", { status: 202 });
+    return { status: 202, message: "Queued" };
   }
 }
 
-async function runRetryQueue(env) {
+async function runRetryQueue(env, limit = 10, skipIp = null) {
   const rows = await env.DB.prepare(`
-    SELECT ip, country, created_at
+    SELECT ip, country, created_at, attempts
     FROM exclusion_queue
     WHERE processed = 0
-    ORDER BY created_at ASC
-    LIMIT 20
-  `).all();
+    ORDER BY attempts ASC, created_at ASC
+    LIMIT ?
+  `).bind(limit).all();
 
-  if (!rows || !rows.results || rows.results.length === 0) return;
+  if (!rows?.results?.length) return;
 
   const accessToken = await getAccessToken(env);
 
   for (const row of rows.results) {
     const ip = row.ip;
+    if (!ip || ip === skipIp) continue;
+
     const country = row.country || "XX";
-    const ts = row.created_at || Math.floor(Date.now() / 1000);
+    const ts = Number(row.created_at || Math.floor(Date.now() / 1000));
 
     try {
       const existing = await env.DB
@@ -111,12 +122,6 @@ async function runRetryQueue(env) {
 
       const resourceName = await addIpBlock(env, accessToken, ip);
 
-      if (!resourceName) {
-        await queueFailure(env, ip, country, ts, "retry addIpBlock returned null");
-        console.log("Retry add failed:", ip);
-        continue;
-      }
-
       await env.DB.prepare(`
         INSERT INTO ads_exclusions (ip, resource_name, created_at)
         VALUES (?, ?, ?)
@@ -134,7 +139,7 @@ async function runRetryQueue(env) {
       await safeUpdateIpLog(env, ip, 1, "success");
       console.log("Retry add success:", ip);
     } catch (err) {
-      const msg = String(err?.message || err || "retry error");
+      const msg = normalizeError(err);
       await queueFailure(env, ip, country, ts, msg);
       console.log("Retry exception:", ip, msg);
     }
@@ -142,18 +147,20 @@ async function runRetryQueue(env) {
 }
 
 async function queueFailure(env, ip, country, ts, errorText) {
+  const errMsg = String(errorText || "unknown error").slice(0, 1000);
+
   await env.DB.prepare(`
     INSERT INTO exclusion_queue (ip, country, created_at, attempts, last_error, processed)
     VALUES (?, ?, ?, 1, ?, 0)
     ON CONFLICT(ip) DO UPDATE SET
       country = excluded.country,
-      created_at = excluded.created_at,
-      attempts = exclusion_queue.attempts + 1,
+      created_at = exclusion_queue.created_at,
+      attempts = COALESCE(exclusion_queue.attempts, 0) + 1,
       last_error = excluded.last_error,
       processed = 0
-  `).bind(ip, country, ts, String(errorText).slice(0, 1000)).run();
+  `).bind(ip, country, ts, errMsg).run();
 
-  await safeUpdateIpLog(env, ip, 0, `queued: ${String(errorText).slice(0, 200)}`);
+  await safeUpdateIpLog(env, ip, 0, `queued: ${errMsg.slice(0, 200)}`);
 }
 
 async function safeUpdateIpLog(env, ip, pushedToAds, statusText) {
@@ -179,17 +186,27 @@ async function getAccessToken(env) {
     body,
   });
 
+  const txt = await r.text();
+
   if (!r.ok) {
-    const txt = await r.text();
-    throw new Error(`Token refresh failed: ${txt}`);
+    throw new Error(`Token refresh failed ${r.status}: ${txt}`);
   }
 
-  const j = await r.json();
+  let j;
+  try {
+    j = JSON.parse(txt);
+  } catch {
+    throw new Error(`Token refresh parse failed: ${txt}`);
+  }
+
+  if (!j?.access_token) {
+    throw new Error("Token refresh returned no access_token");
+  }
+
   return j.access_token;
 }
 
 async function addIpBlock(env, accessToken, ip) {
-  // لا نكرر الإضافة إذا وصل العدد 500 نحذف الأقدم أولًا
   const countRow = await env.DB
     .prepare("SELECT COUNT(*) AS c FROM ads_exclusions")
     .first();
@@ -204,9 +221,11 @@ async function addIpBlock(env, accessToken, ip) {
       LIMIT 1
     `).first();
 
-    if (oldest && oldest.resource_name) {
+    if (oldest?.resource_name) {
       await removeCampaignCriterion(env, accessToken, oldest.resource_name);
       await env.DB.prepare("DELETE FROM ads_exclusions WHERE ip = ?").bind(oldest.ip).run();
+    } else {
+      throw new Error("limit reached but oldest resource_name missing");
     }
   }
 
@@ -233,16 +252,25 @@ async function addIpBlock(env, accessToken, ip) {
     body: JSON.stringify(payload),
   });
 
-  const j = await r.json();
+  const txt = await r.text();
 
   if (!r.ok) {
-    console.log("addIpBlock failed", ip, "status:", r.status, JSON.stringify(j));
-    return null;
+    throw new Error(`addIpBlock failed ${r.status}: ${txt}`);
   }
 
-  return j && j.results && j.results[0] && j.results[0].resourceName
-    ? j.results[0].resourceName
-    : null;
+  let j;
+  try {
+    j = JSON.parse(txt);
+  } catch {
+    throw new Error(`addIpBlock parse failed: ${txt}`);
+  }
+
+  const resourceName = j?.results?.[0]?.resourceName;
+  if (!resourceName) {
+    throw new Error(`addIpBlock succeeded but resourceName missing: ${txt}`);
+  }
+
+  return resourceName;
 }
 
 async function removeCampaignCriterion(env, accessToken, resourceName) {
@@ -261,17 +289,41 @@ async function removeCampaignCriterion(env, accessToken, resourceName) {
     body: JSON.stringify(payload),
   });
 
+  const txt = await r.text();
+
   if (!r.ok) {
-    const txt = await r.text();
-    console.log("removeCampaignCriterion failed", r.status, txt);
+    throw new Error(`removeCampaignCriterion failed ${r.status}: ${txt}`);
   }
+
+  return true;
 }
 
 function googleHeaders(env, accessToken) {
-  return {
+  const headers = {
     "Content-Type": "application/json",
     "Authorization": `Bearer ${accessToken}`,
     "developer-token": env.GOOGLE_DEVELOPER_TOKEN,
-    "login-customer-id": env.GOOGLE_LOGIN_CUSTOMER_ID
   };
+
+  if (env.GOOGLE_LOGIN_CUSTOMER_ID) {
+    headers["login-customer-id"] = String(env.GOOGLE_LOGIN_CUSTOMER_ID);
+  }
+
+  return headers;
+}
+
+function normalizeError(err) {
+  return String(err?.message || err || "unknown error");
+}
+
+function isValidIp(ip) {
+  if (!ip) return false;
+
+  const ipv4 =
+    /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+
+  const ipv6 =
+    /^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|::1|([0-9a-fA-F]{1,4}:){1,7}:|:((:[0-9a-fA-F]{1,4}){1,7}))$/;
+
+  return ipv4.test(ip) || ipv6.test(ip) || ip.includes(":");
 }
