@@ -1,5 +1,11 @@
 export default {
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/do-check") {
+      return handleDoCheck(request, env);
+    }
+
     return handleFetch(request, env, ctx);
   },
 
@@ -34,178 +40,147 @@ async function handleFetch(request, env, ctx) {
   }
 
   try {
-    // إذا كان هذا الـ IP مستبعدًا سابقًا في سجلاتنا فلا نكرر الإضافة
-    const existing = await env.DB
-      .prepare(`SELECT ip FROM ads_exclusions WHERE ip = ?`)
-      .bind(ip)
-      .first();
-
-    if (existing) {
-      await env.DB.prepare(`
-        UPDATE ip_logs
-        SET pushed_to_ads = 1,
-            last_push_status = 'already_excluded'
-        WHERE ip = ?
-      `).bind(ip).run();
-
-      return new Response("Already excluded", { status: 200 });
-    }
-
     const accessToken = await getAccessToken(env);
-    const ok = await processSingleIp(env, accessToken, ip, ts);
+    const ok = await processSingleIp(env, accessToken, ip);
 
     if (ok) {
-      await env.DB.prepare(`
-        UPDATE ip_logs
-        SET pushed_to_ads = 1,
-            last_push_status = 'success'
-        WHERE ip = ?
-      `).bind(ip).run();
-
-      await env.DB.prepare(`
-        DELETE FROM exclusion_queue WHERE ip = ?
-      `).bind(ip).run();
-
       console.log("Direct add success:", ip);
       return new Response("OK", { status: 200 });
     }
 
-    await queueFailure(env, ip, country, ts, "addIpBlock returned null");
-    console.log("Direct add failed, queued:", ip);
+    // فشل الإضافة → خزّن push احتياطيًا
+    const key = `push:${ts}:${country}:${ip}`;
+    await env.VISITS.put(key, "1", { expirationTtl: 7 * 24 * 3600 });
+
+    console.log("Direct add failed, saved to retry queue:", ip);
     return new Response("Queued", { status: 202 });
   } catch (err) {
-    const msg = String(err?.message || err || "unknown error");
-    await queueFailure(env, ip, country, ts, msg);
-    console.log("Direct worker exception, queued:", ip, msg);
+    // أي خطأ عام → خزّن push احتياطيًا
+    const key = `push:${ts}:${country}:${ip}`;
+    await env.VISITS.put(key, "1", { expirationTtl: 7 * 24 * 3600 });
+
+    console.log("Direct worker exception, saved to retry queue:", ip, String(err));
     return new Response("Queued", { status: 202 });
   }
-}
-
-async function queueFailure(env, ip, country, ts, errorText) {
-  await env.DB.prepare(`
-    INSERT INTO exclusion_queue (ip, country, created_at, attempts, last_error, processed)
-    VALUES (?, ?, ?, 1, ?, 0)
-    ON CONFLICT(ip) DO UPDATE SET
-      country = excluded.country,
-      created_at = excluded.created_at,
-      attempts = exclusion_queue.attempts + 1,
-      last_error = excluded.last_error,
-      processed = 0
-  `).bind(ip, country, ts, String(errorText).slice(0, 1000)).run();
-
-  await env.DB.prepare(`
-    UPDATE ip_logs
-    SET pushed_to_ads = 0,
-        last_push_status = ?
-    WHERE ip = ?
-  `).bind(`queued: ${String(errorText).slice(0, 200)}`, ip).run();
 }
 
 async function runRetryQueue(env) {
-  const rows = await env.DB.prepare(`
-    SELECT ip, country, created_at
-    FROM exclusion_queue
-    WHERE processed = 0
-    ORDER BY created_at ASC
-    LIMIT 20
-  `).all();
+  const kv = env.VISITS;
 
-  if (!rows?.results?.length) return;
+  const batch = await kv.list({ prefix: "push:", limit: 50 });
+  if (!batch.keys || batch.keys.length === 0) return;
 
   const accessToken = await getAccessToken(env);
 
-  for (const row of rows.results) {
-    const ip = row.ip;
-    const country = row.country || "XX";
-    const ts = row.created_at || Math.floor(Date.now() / 1000);
-
+  let order = [];
+  const orderRaw = await kv.get("ads:order");
+  if (orderRaw) {
     try {
-      const existing = await env.DB
-        .prepare(`SELECT ip FROM ads_exclusions WHERE ip = ?`)
-        .bind(ip)
-        .first();
+      order = JSON.parse(orderRaw);
+    } catch {}
+  }
+  if (!Array.isArray(order)) order = [];
 
-      if (existing) {
-        await env.DB.prepare(`
-          UPDATE exclusion_queue
-          SET processed = 1, last_error = NULL
-          WHERE ip = ?
-        `).bind(ip).run();
+  for (const k of batch.keys) {
+    const keyName = k.name;
 
-        await env.DB.prepare(`
-          UPDATE ip_logs
-          SET pushed_to_ads = 1,
-              last_push_status = 'success'
-          WHERE ip = ?
-        `).bind(ip).run();
+    const parts = keyName.split(":");
+    const ip = parts.slice(3).join(":"); // يدعم IPv6
+    if (!ip) {
+      await kv.delete(keyName);
+      continue;
+    }
 
-        continue;
-      }
+    const doneKey = `ads:done:${ip}`;
+    const alreadyDone = await kv.get(doneKey);
+    if (alreadyDone) {
+      await kv.delete(keyName);
+      continue;
+    }
 
-      const ok = await processSingleIp(env, accessToken, ip, ts);
+    const count = await countIpBlocks(env, accessToken);
+    if (count >= 500) {
+      await removeOldest(env, accessToken, kv, order);
+    }
 
-      if (ok) {
-        await env.DB.prepare(`
-          UPDATE exclusion_queue
-          SET processed = 1, last_error = NULL
-          WHERE ip = ?
-        `).bind(ip).run();
+    const resourceName = await addIpBlock(env, accessToken, ip);
 
-        await env.DB.prepare(`
-          UPDATE ip_logs
-          SET pushed_to_ads = 1,
-              last_push_status = 'success'
-          WHERE ip = ?
-        `).bind(ip).run();
-
-        console.log("Retry add success:", ip);
-      } else {
-        await queueFailure(env, ip, country, ts, "retry addIpBlock returned null");
-        console.log("Retry add failed:", ip);
-      }
-    } catch (err) {
-      await queueFailure(env, ip, country, ts, String(err?.message || err || "retry error"));
-      console.log("Retry exception:", ip, String(err?.message || err || err));
+    if (resourceName) {
+      order.push(ip);
+      await kv.put("ads:order", JSON.stringify(order));
+      await kv.put(`ads:ip:${ip}`, resourceName);
+      await kv.put(doneKey, "1", { expirationTtl: 7 * 24 * 3600 });
+      await kv.delete(keyName);
+      console.log("Retry add success:", ip);
+    } else {
+      console.log("Retry add failed:", ip);
     }
   }
 }
 
-async function processSingleIp(env, accessToken, ip, ts) {
-  const countRow = await env.DB.prepare(`
-    SELECT COUNT(*) AS c
-    FROM ads_exclusions
-  `).first();
+async function processSingleIp(env, accessToken, ip) {
+  const kv = env.VISITS;
 
-  const count = Number(countRow?.c || 0);
+  const doneKey = `ads:done:${ip}`;
+  const alreadyDone = await kv.get(doneKey);
+  if (alreadyDone) {
+    console.log("Already done, skip:", ip);
+    return true;
+  }
 
+  let order = [];
+  const orderRaw = await kv.get("ads:order");
+  if (orderRaw) {
+    try {
+      order = JSON.parse(orderRaw);
+    } catch {}
+  }
+  if (!Array.isArray(order)) order = [];
+
+  const count = await countIpBlocks(env, accessToken);
   if (count >= 500) {
-    const oldest = await env.DB.prepare(`
-      SELECT ip, resource_name
-      FROM ads_exclusions
-      ORDER BY created_at ASC
-      LIMIT 1
-    `).first();
-
-    if (oldest?.resource_name) {
-      await removeCampaignCriterion(env, accessToken, oldest.resource_name);
-      await env.DB.prepare(`
-        DELETE FROM ads_exclusions WHERE ip = ?
-      `).bind(oldest.ip).run();
-    }
+    await removeOldest(env, accessToken, kv, order);
   }
 
   const resourceName = await addIpBlock(env, accessToken, ip);
   if (!resourceName) return false;
 
-  await env.DB.prepare(`
-    INSERT INTO ads_exclusions (ip, resource_name, created_at)
-    VALUES (?, ?, ?)
-    ON CONFLICT(ip) DO UPDATE SET
-      resource_name = excluded.resource_name,
-      created_at = excluded.created_at
-  `).bind(ip, resourceName, ts).run();
+  order.push(ip);
+  await kv.put("ads:order", JSON.stringify(order));
+  await kv.put(`ads:ip:${ip}`, resourceName);
+  await kv.put(doneKey, "1", { expirationTtl: 7 * 24 * 3600 });
 
   return true;
+}
+
+async function handleDoCheck(request, env) {
+  if (request.method !== "POST") {
+    return new Response("Method Not Allowed", { status: 405 });
+  }
+
+  const secret = request.headers.get("x-worker-secret");
+  if (!secret || secret !== env.WORKER_SHARED_SECRET) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response("Invalid JSON", { status: 400 });
+  }
+
+  const ip = body?.ip || "unknown";
+  const country = body?.country || "XX";
+
+  const id = env.IP_GUARD.idFromName(ip);
+  const stub = env.IP_GUARD.get(id);
+
+  return stub.fetch("https://dummy/do", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ip, country }),
+  });
 }
 
 async function getAccessToken(env) {
@@ -265,6 +240,22 @@ async function addIpBlock(env, accessToken, ip) {
   return j?.results?.[0]?.resourceName || null;
 }
 
+async function removeOldest(env, accessToken, kv, order) {
+  while (order.length > 0) {
+    const oldestIp = order.shift();
+    const resName = await kv.get(`ads:ip:${oldestIp}`);
+    await kv.delete(`ads:ip:${oldestIp}`);
+
+    if (resName) {
+      await removeCampaignCriterion(env, accessToken, resName);
+      await kv.put("ads:order", JSON.stringify(order));
+      return;
+    }
+  }
+
+  await kv.put("ads:order", JSON.stringify(order));
+}
+
 async function removeCampaignCriterion(env, accessToken, resourceName) {
   const url = `https://googleads.googleapis.com/v22/customers/${env.GOOGLE_ADS_CUSTOMER_ID}/campaignCriteria:mutate`;
 
@@ -287,11 +278,151 @@ async function removeCampaignCriterion(env, accessToken, resourceName) {
   }
 }
 
+async function countIpBlocks(env, accessToken) {
+  const query = `
+    SELECT campaign_criterion.resource_name
+    FROM campaign_criterion
+    WHERE campaign_criterion.campaign = 'customers/${env.GOOGLE_ADS_CUSTOMER_ID}/campaigns/${env.GOOGLE_ADS_CAMPAIGN_ID}'
+      AND campaign_criterion.negative = TRUE
+      AND campaign_criterion.type = IP_BLOCK
+    LIMIT 1000
+  `;
+
+  const url = `https://googleads.googleapis.com/v22/customers/${env.GOOGLE_ADS_CUSTOMER_ID}/googleAds:search`;
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: googleHeaders(env, accessToken),
+    body: JSON.stringify({ query }),
+  });
+
+  const j = await r.json();
+
+  if (!r.ok) {
+    console.log("countIpBlocks failed", r.status, JSON.stringify(j));
+    return 0;
+  }
+
+  return j?.results?.length || 0;
+}
+
 function googleHeaders(env, accessToken) {
   return {
     "Content-Type": "application/json",
     "Authorization": `Bearer ${accessToken}`,
     "developer-token": env.GOOGLE_DEVELOPER_TOKEN,
-    "login-customer-id": env.GOOGLE_LOGIN_CUSTOMER_ID
+    "login-customer-id": "1486808188"
   };
+}
+
+export class IpGuard {
+  constructor(ctx, env) {
+    this.ctx = ctx;
+    this.env = env;
+    this.storage = ctx.storage;
+  }
+
+  async fetch(request) {
+    if (request.method !== "POST") {
+      return new Response("Method Not Allowed", { status: 405 });
+    }
+
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return new Response("Invalid JSON", { status: 400 });
+    }
+
+    const ip = body?.ip || "unknown";
+    const country = body?.country || "XX";
+
+    const now = Math.floor(Date.now() / 1000);
+    const windowSeconds = 24 * 3600;
+    const banSeconds = 7 * 24 * 3600;
+
+    const state = (await this.storage.get("state")) || {
+      ip,
+      country,
+      count: 0,
+      firstSeen: now,
+      lastSeen: now,
+      bannedUntil: 0,
+      pushNeeded: false
+    };
+
+    state.lastSeen = now;
+    state.ip = ip;
+    state.country = country;
+
+    // اليمن: حظر مباشر
+    if (country === "YE") {
+      state.bannedUntil = now + banSeconds;
+      state.pushNeeded = true;
+
+      await this.storage.put("state", state);
+
+      return Response.json({
+        ok: true,
+        action: "ban",
+        reason: "YE",
+        pushNeeded: true
+      });
+    }
+
+    // غير السعودية: دخول عادي بدون عداد
+    if (country !== "SA") {
+      await this.storage.put("state", state);
+
+      return Response.json({
+        ok: true,
+        action: "allow",
+        pushNeeded: false
+      });
+    }
+
+    // إذا كان محظورًا مسبقًا
+    if (state.bannedUntil && state.bannedUntil > now) {
+      state.count += 1;
+      await this.storage.put("state", state);
+
+      return Response.json({
+        ok: true,
+        action: "ban",
+        reason: "already_banned",
+        pushNeeded: false
+      });
+    }
+
+    // إعادة ضبط العداد بعد 24 ساعة
+    if (!state.firstSeen || (now - state.firstSeen) > windowSeconds) {
+      state.count = 0;
+      state.firstSeen = now;
+    }
+
+    state.count += 1;
+
+    // بعد المرتين: حظر
+    if (state.count > 2) {
+      state.bannedUntil = now + banSeconds;
+      state.pushNeeded = true;
+
+      await this.storage.put("state", state);
+
+      return Response.json({
+        ok: true,
+        action: "ban",
+        reason: "too_many_clicks",
+        pushNeeded: true
+      });
+    }
+
+    await this.storage.put("state", state);
+
+    return Response.json({
+      ok: true,
+      action: "allow",
+      pushNeeded: false
+    });
+  }
 }
