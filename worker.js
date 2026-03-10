@@ -15,13 +15,15 @@ async function handleFetch(request, env, ctx) {
 
   const secret = request.headers.get("x-worker-secret");
   if (!secret || secret !== env.WORKER_SHARED_SECRET) {
+    console.log("Unauthorized request: bad or missing secret");
     return new Response("Unauthorized", { status: 401 });
   }
 
   let body;
   try {
     body = await request.json();
-  } catch {
+  } catch (err) {
+    console.log("Invalid JSON body", String(err));
     return new Response("Invalid JSON", { status: 400 });
   }
 
@@ -34,13 +36,15 @@ async function handleFetch(request, env, ctx) {
   }
 
   if (!isValidIp(ip)) {
+    console.log("Invalid IP format", ip);
     await queueFailure(env, ip, country, ts, "invalid ip format");
     return new Response("Invalid IP", { status: 400 });
   }
 
+  console.log("Incoming exclusion request", { ip, country, ts });
+
   const result = await processCurrentIp(env, ip, country, ts);
 
-  // بعد معالجة الطلب الحالي مباشرة، افحص الفاشل في الخلفية
   ctx.waitUntil(runRetryQueue(env, 10, ip));
 
   return new Response(result.message, { status: result.status });
@@ -49,13 +53,14 @@ async function handleFetch(request, env, ctx) {
 async function processCurrentIp(env, ip, country, ts) {
   try {
     const existing = await env.DB
-      .prepare("SELECT ip FROM ads_exclusions WHERE ip = ?")
+      .prepare("SELECT ip, resource_name FROM ads_exclusions WHERE ip = ?")
       .bind(ip)
       .first();
 
     if (existing) {
       await safeUpdateIpLog(env, ip, 1, "already_excluded");
       await env.DB.prepare("DELETE FROM exclusion_queue WHERE ip = ?").bind(ip).run();
+      console.log("Already excluded:", ip);
       return { status: 200, message: "Already excluded" };
     }
 
@@ -73,28 +78,54 @@ async function processCurrentIp(env, ip, country, ts) {
     await safeUpdateIpLog(env, ip, 1, "success");
     await env.DB.prepare("DELETE FROM exclusion_queue WHERE ip = ?").bind(ip).run();
 
-    console.log("Direct add success:", ip);
+    console.log("Direct add success", { ip, resourceName });
     return { status: 200, message: "OK" };
   } catch (err) {
     const msg = normalizeError(err);
-    await queueFailure(env, ip, country, ts, msg);
-    console.log("Direct worker exception, queued:", ip, msg);
+    console.log("Direct worker exception", { ip, error: msg });
+
+    try {
+      await queueFailure(env, ip, country, ts, msg);
+    } catch (queueErr) {
+      console.log("queueFailure failed", {
+        ip,
+        originalError: msg,
+        queueError: normalizeError(queueErr),
+      });
+      await safeUpdateIpLog(env, ip, 0, `queue_failure: ${msg.slice(0, 200)}`);
+    }
+
     return { status: 202, message: "Queued" };
   }
 }
 
 async function runRetryQueue(env, limit = 10, skipIp = null) {
-  const rows = await env.DB.prepare(`
-    SELECT ip, country, created_at, attempts
-    FROM exclusion_queue
-    WHERE processed = 0
-    ORDER BY attempts ASC, created_at ASC
-    LIMIT ?
-  `).bind(limit).all();
+  let rows;
+  try {
+    rows = await env.DB.prepare(`
+      SELECT ip, country, created_at, attempts
+      FROM exclusion_queue
+      WHERE processed = 0
+      ORDER BY attempts ASC, created_at ASC
+      LIMIT ?
+    `).bind(limit).all();
+  } catch (err) {
+    console.log("Failed to read exclusion_queue", normalizeError(err));
+    return;
+  }
 
-  if (!rows?.results?.length) return;
+  if (!rows?.results?.length) {
+    console.log("Retry queue empty");
+    return;
+  }
 
-  const accessToken = await getAccessToken(env);
+  let accessToken;
+  try {
+    accessToken = await getAccessToken(env);
+  } catch (err) {
+    console.log("Retry queue token fetch failed", normalizeError(err));
+    return;
+  }
 
   for (const row of rows.results) {
     const ip = row.ip;
@@ -117,6 +148,7 @@ async function runRetryQueue(env, limit = 10, skipIp = null) {
         `).bind(ip).run();
 
         await safeUpdateIpLog(env, ip, 1, "success");
+        console.log("Retry skipped, already excluded", { ip });
         continue;
       }
 
@@ -137,17 +169,29 @@ async function runRetryQueue(env, limit = 10, skipIp = null) {
       `).bind(ip).run();
 
       await safeUpdateIpLog(env, ip, 1, "success");
-      console.log("Retry add success:", ip);
+      console.log("Retry add success", { ip, resourceName });
     } catch (err) {
       const msg = normalizeError(err);
-      await queueFailure(env, ip, country, ts, msg);
-      console.log("Retry exception:", ip, msg);
+      console.log("Retry exception", { ip, error: msg });
+
+      try {
+        await queueFailure(env, ip, country, ts, msg);
+      } catch (queueErr) {
+        console.log("Retry queueFailure failed", {
+          ip,
+          originalError: msg,
+          queueError: normalizeError(queueErr),
+        });
+        await safeUpdateIpLog(env, ip, 0, `retry_queue_failure: ${msg.slice(0, 200)}`);
+      }
     }
   }
 }
 
 async function queueFailure(env, ip, country, ts, errorText) {
   const errMsg = String(errorText || "unknown error").slice(0, 1000);
+
+  console.log("queueFailure", { ip, country, errMsg });
 
   await env.DB.prepare(`
     INSERT INTO exclusion_queue (ip, country, created_at, attempts, last_error, processed)
@@ -164,12 +208,21 @@ async function queueFailure(env, ip, country, ts, errorText) {
 }
 
 async function safeUpdateIpLog(env, ip, pushedToAds, statusText) {
-  await env.DB.prepare(`
-    UPDATE ip_logs
-    SET pushed_to_ads = ?,
-        last_push_status = ?
-    WHERE ip = ?
-  `).bind(pushedToAds, statusText, ip).run();
+  try {
+    await env.DB.prepare(`
+      UPDATE ip_logs
+      SET pushed_to_ads = ?,
+          last_push_status = ?
+      WHERE ip = ?
+    `).bind(pushedToAds, statusText, ip).run();
+  } catch (err) {
+    console.log("safeUpdateIpLog failed", {
+      ip,
+      pushedToAds,
+      statusText,
+      error: normalizeError(err),
+    });
+  }
 }
 
 async function getAccessToken(env) {
@@ -224,19 +277,31 @@ async function addIpBlock(env, accessToken, ip) {
     if (oldest?.resource_name) {
       await removeCampaignCriterion(env, accessToken, oldest.resource_name);
       await env.DB.prepare("DELETE FROM ads_exclusions WHERE ip = ?").bind(oldest.ip).run();
+      console.log("Removed oldest exclusion to free slot", { ip: oldest.ip });
     } else {
       throw new Error("limit reached but oldest resource_name missing");
     }
   }
 
-  const url = `https://googleads.googleapis.com/v22/customers/${env.GOOGLE_ADS_CUSTOMER_ID}/campaignCriteria:mutate`;
+  const customerId = String(env.GOOGLE_ADS_CUSTOMER_ID || "").replace(/-/g, "");
+  const campaignId = String(env.GOOGLE_ADS_CAMPAIGN_ID || "").replace(/-/g, "");
+
+  if (!customerId) {
+    throw new Error("GOOGLE_ADS_CUSTOMER_ID missing");
+  }
+
+  if (!campaignId) {
+    throw new Error("GOOGLE_ADS_CAMPAIGN_ID missing");
+  }
+
+  const url = `https://googleads.googleapis.com/v22/customers/${customerId}/campaignCriteria:mutate`;
 
   const payload = {
-    customerId: String(env.GOOGLE_ADS_CUSTOMER_ID),
+    customerId,
     operations: [
       {
         create: {
-          campaign: `customers/${env.GOOGLE_ADS_CUSTOMER_ID}/campaigns/${env.GOOGLE_ADS_CAMPAIGN_ID}`,
+          campaign: `customers/${customerId}/campaigns/${campaignId}`,
           negative: true,
           ipBlock: {
             ipAddress: ip
@@ -245,6 +310,8 @@ async function addIpBlock(env, accessToken, ip) {
       }
     ]
   };
+
+  console.log("Sending Google Ads mutate", { customerId, campaignId, ip });
 
   const r = await fetch(url, {
     method: "POST",
@@ -274,10 +341,16 @@ async function addIpBlock(env, accessToken, ip) {
 }
 
 async function removeCampaignCriterion(env, accessToken, resourceName) {
-  const url = `https://googleads.googleapis.com/v22/customers/${env.GOOGLE_ADS_CUSTOMER_ID}/campaignCriteria:mutate`;
+  const customerId = String(env.GOOGLE_ADS_CUSTOMER_ID || "").replace(/-/g, "");
+
+  if (!customerId) {
+    throw new Error("GOOGLE_ADS_CUSTOMER_ID missing");
+  }
+
+  const url = `https://googleads.googleapis.com/v22/customers/${customerId}/campaignCriteria:mutate`;
 
   const payload = {
-    customerId: String(env.GOOGLE_ADS_CUSTOMER_ID),
+    customerId,
     operations: [
       { remove: resourceName }
     ]
@@ -305,8 +378,9 @@ function googleHeaders(env, accessToken) {
     "developer-token": env.GOOGLE_DEVELOPER_TOKEN,
   };
 
-  if (env.GOOGLE_LOGIN_CUSTOMER_ID) {
-    headers["login-customer-id"] = String(env.GOOGLE_LOGIN_CUSTOMER_ID);
+  const loginCustomerId = String(env.GOOGLE_LOGIN_CUSTOMER_ID || "").replace(/-/g, "").trim();
+  if (loginCustomerId) {
+    headers["login-customer-id"] = loginCustomerId;
   }
 
   return headers;
@@ -322,8 +396,5 @@ function isValidIp(ip) {
   const ipv4 =
     /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
 
-  const ipv6 =
-    /^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|::1|([0-9a-fA-F]{1,4}:){1,7}:|:((:[0-9a-fA-F]{1,4}){1,7}))$/;
-
-  return ipv4.test(ip) || ipv6.test(ip) || ip.includes(":");
+  return ipv4.test(ip) || ip.includes(":");
 }
